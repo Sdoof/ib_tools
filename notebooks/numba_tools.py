@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
-from numba import jit
+from numba import jit, int32, float32, deferred_type, typeof
+from numba.experimental import jitclass
 from typing import (Optional, Union, Literal, NewType, Tuple, Type, TypeVar,
                     List)
 from abc import ABC, abstractmethod
@@ -149,18 +150,31 @@ def swing(data: pd.DataFrame, f: Union[float, np.array, pd.Series],
 
 StopMode = NewType('StopMode', Literal['fixed', 'trail'])
 
+bracket_spec = [('distance', float32),
+                ('position', int32),
+                ('entry', float32),
+                ('trigger', float32), ]
 
-class BaseBracket(ABC):
 
-    def __init__(self, distance: float, signal: int, high: float = 0,
-                 low: float = 0, entry: float = 0) -> None:
+@jitclass(bracket_spec)
+class BaseBracket():
+    """
+    Doesn't inherit from ABC to make it numba friendly.
+
+    @evaluate is an abstractmethod.
+    """
+
+    def __init__(self) -> None:
+        pass
+
+    def open(self, distance: float, signal: int, high: float = 0,
+             low: float = 0, entry: float = 0) -> None:
         self.distance = distance
         self.position = signal
         self.entry = entry or self.set_entry(high, low)
         self.trigger = self.set_trigger(distance, high, low)
         # print(f'bracket init: {self}, h: {high}, l: {low}')
 
-    @abstractmethod
     def evaluate(self, high: float, low: float) -> bool:
         """
         Bracket has been triggered - True or False?
@@ -183,7 +197,16 @@ class BaseBracket(ABC):
             [f'{k}={v}' for k, v in self.__dict__.items()]) + ')')
 
 
-class TrailStop(BaseBracket):
+@jitclass(bracket_spec)
+class TrailStop():
+
+    open = BaseBracket.open
+    set_entry = BaseBracket.set_entry
+    set_trigger = BaseBracket.set_trigger
+    __repr__ = BaseBracket.__repr__
+
+    def __init__(self) -> None:
+        pass
 
     def evaluate(self, high: float, low: float) -> bool:
         if self.position == -1:
@@ -200,7 +223,15 @@ class TrailStop(BaseBracket):
                 return False
 
 
-class FixedStop(BaseBracket):
+@jitclass(bracket_spec)
+class FixedStop():
+    open = BaseBracket.open
+    set_entry = BaseBracket.set_entry
+    set_trigger = BaseBracket.set_trigger
+    __repr__ = BaseBracket.__repr__
+
+    def __init__(self) -> None:
+        pass
 
     def evaluate(self, high: float, low: float) -> bool:
         if self.position == 1 and self.trigger >= low:
@@ -211,12 +242,17 @@ class FixedStop(BaseBracket):
             return False
 
 
-class TakeProfit(BaseBracket):
+@jitclass(bracket_spec)
+class TakeProfit():
+    multiple: float
 
-    @classmethod
-    def set_up(cls, multiple: float) -> Type[BaseBracket]:
-        cls.multiple = multiple
-        return cls
+    open = BaseBracket.open
+    set_entry = BaseBracket.set_entry
+    set_trigger = BaseBracket.set_trigger
+    __repr__ = BaseBracket.__repr__
+
+    def __init__(self, multiple: float) -> None:
+        self.multiple = multiple
 
     def evaluate(self, high: float, low: float) -> bool:
         if self.position == -1 and self.trigger >= low:
@@ -231,9 +267,14 @@ class TakeProfit(BaseBracket):
         return self.entry + distance * self.position * self.multiple
 
 
+@jitclass
 class NoTakeProfit:
+    __repr__ = BaseBracket.__repr__
 
-    def __init__(self, *args):
+    def __init__(self) -> None:
+        pass
+
+    def open(self, distance, signal, high, low):
         pass
 
     def evaluate(self, high: float, low: float) -> bool:
@@ -244,25 +285,34 @@ stop_dict = {'fixed': FixedStop, 'trail': TrailStop}
 
 A = TypeVar('A', bound='Adjust')
 
+adjusted_stop_type = deferred_type()
 
+
+@jitclass([('adjusted_stop', adjusted_stop_type)])
 class Adjust:
 
-    def __init__(self, stop_distance: float,  signal: int, high: float = 0,
-                 low: float = 0, entry: float = 0) -> None:
+    adjusted_stop_distance: float
+    position: int
+    done: bool
+    trigger_multiple: float
+    stop_multiple: float
+    trigger: float
+
+    def __init__(self, adjusted_stop: BaseBracket,
+                 trigger_multiple: float, stop_multiple: float
+                 ) -> None:
+        self.adjusted_stop = adjusted_stop
+        self.trigger_multiple = trigger_multiple
+        self.stop_multiple = stop_multiple
+
+    def open(self, stop_distance: float,  signal: int, high: float = 0,
+             low: float = 0, entry: float = 0) -> None:
         self.adjusted_stop_distance = stop_distance * self.stop_multiple
         adjusted_trigger_distance = stop_distance * self.trigger_multiple
         self.position = signal
         self.set_trigger(adjusted_trigger_distance, high, low, entry)
         self.done = False
         # print(f'Adjust init: {self}')
-
-    @classmethod
-    def set_up(cls, adjusted_stop: str, trigger_multiple: float,
-               stop_multiple: float) -> Type[A]:
-        cls.adjusted_stop = adjusted_stop
-        cls.trigger_multiple = trigger_multiple
-        cls.stop_multiple = stop_multiple
-        return cls
 
     def evaluate(self, order: BaseBracket, high: float, low: float
                  ) -> BaseBracket:
@@ -276,7 +326,7 @@ class Adjust:
         elif ((self.position == -1 and self.trigger >= low)
                 or (self.position == 1 and self.trigger <= high)):
 
-            adjusted = self.adjusted_stop(
+            adjusted = self.adjusted_stop.open(
                 self.adjusted_stop_distance, order.position,
                 entry=self.trigger)
             # print(f'Adjusted: {order} to {adjusted} at h: {high}, l: {low}')
@@ -295,27 +345,49 @@ class Adjust:
             [f'{k}={v}' for k, v in self.__dict__.items()]) + ')')
 
 
+@jitclass
 class NoAdjust:
-    def __init__(self, *args):
+    def __init__(self) -> None:
+        pass
+
+    def open(self, stop_distance: float,  signal: int, high: float = 0,
+             low: float = 0, entry: float = 0) -> None:
         pass
 
     def evaluate(self, order: BaseBracket, *args) -> BaseBracket:
         return order
 
 
+stop_type = deferred_type()
+tp_type = deferred_type()
+adjust_type = deferred_type()
+
+context_spec = [('stop', stop_type),
+                ('tp', tp_type),
+                ('adjust', adjust_type),
+                ('signal', int32),
+                ('high', float32),
+                ('low', float32),
+                ('distance', float32),
+                ]
+
+
+@jitclass(context_spec)
 class Context:
+    always_on: bool
+    position: int
 
     def __init__(self, stop: BaseBracket, tp: Union[TakeProfit, NoTakeProfit],
                  adjust: Union[Adjust, NoAdjust], always_on: bool = True
                  ) -> None:
-        self._stop = stop
-        self._tp = tp
-        self._adjust = adjust
+        self.stop = stop
+        self.tp = tp
+        self.adjust = adjust
         self.always_on = always_on
         self.position = 0
         # print(f'Context init: {self}')
 
-    def __call__(self, row: np.array) -> int:
+    def process_row(self, row: np.array) -> int:
         self.signal = row[0]
         self.high = row[1]
         self.low = row[2]
@@ -343,12 +415,12 @@ class Context:
             self.open_position()
 
     def open_position(self) -> None:
-        self.stop = self._stop(self.distance, self.signal,
-                               self.high, self.low)
-        self.tp = self._tp(self.distance, self.signal,
-                           self.high, self.low)
-        self.adjust = self._adjust(self.distance, self.signal,
-                                   self.high, self.low)
+        self.stop.open(self.distance, self.signal,
+                       self.high, self.low)
+        self.tp.open(self.distance, self.signal,
+                     self.high, self.low)
+        self.adjust.open(self.distance, self.signal,
+                         self.high, self.low)
         self.position = self.signal
 
     def close_position(self) -> None:
@@ -373,6 +445,7 @@ class Context:
             [f'{k}={v}' for k, v in self.__dict__.items()]) + ')')
 
 
+@jit(nopython=True)
 def _stop_loss(data: np.array, stop: Context) -> np.array:
     """
     Args:
@@ -391,7 +464,7 @@ def _stop_loss(data: np.array, stop: Context) -> np.array:
 
     out = np.zeros((data.shape[0], 1), dtype=np.float32)
     for i, row in enumerate(data):
-        out[i] = stop(row)
+        out[i] = stop.process_row(row)
     return out
 
 
@@ -410,26 +483,43 @@ def param_factory(mode: StopMode, tp_multiple: Optional[float] = None,
         assert adjust_tuple[1] < tp_multiple, (
             'Take profit multiple must be > adjust trigger multiple. Otherwise'
             ' position would be closed before stop loss can be adjusted.')
-
-    stop = stop_dict.get(mode)
-    if not stop:
-        raise ValueError(f"Invalid stop loss type: {mode}. "
-                         f"Must be 'fixed' or 'trail'")
-
+    assert stop_dict.get(mode), (f"Invalid stop loss type: {mode}. "
+                                 f"Must be 'fixed' or 'trail'")
+    stop = stop_dict.get(mode)()
     if tp_multiple:
-        tp = TakeProfit.set_up(tp_multiple)
+        tp = TakeProfit(tp_multiple)
     else:
-        tp = NoTakeProfit
+        tp = NoTakeProfit()
 
     if adjust_tuple:
-        adjusted_stop = stop_dict.get(adjust_tuple[0])
-        if not stop:
-            raise ValueError(f"Invalid adjusted stop loss type: "
-                             f"{adjust_tuple[0]}. "
-                             f"Must be 'fixed' or 'trail'")
-        adjust = Adjust.set_up(adjusted_stop, adjust_tuple[1], adjust_tuple[2])
+        assert stop_dict.get(adjust_tuple[0]), (
+            f"Invalid adjusted stop loss type: "
+            f"{adjust_tuple[0]}. "
+            f"Must be 'fixed' or 'trail'")
+        adjusted_stop = stop_dict.get(adjust_tuple[0])()
+
+        try:
+            adjusted_stop_type.define(typeof(adjusted_stop))
+        except TypeError:
+            pass
+
+        adjust = Adjust(adjusted_stop, adjust_tuple[1],
+                        adjust_tuple[2])
     else:
-        adjust = NoAdjust
+        adjust = NoAdjust()
+
+    try:
+        stop_type.define(typeof(stop))
+    except TypeError:
+        pass
+    try:
+        tp_type.define(typeof(tp))
+    except TypeError:
+        pass
+    try:
+        adjust_type.define(typeof(adjust))
+    except TypeError:
+        pass
 
     return (stop, tp, adjust)
 
