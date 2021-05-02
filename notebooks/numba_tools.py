@@ -198,17 +198,27 @@ class BaseBracket():
 
 
 @jitclass(bracket_spec)
-class TrailStop():
+class Stop():
+
+    mode: str
 
     open = BaseBracket.open
     set_entry = BaseBracket.set_entry
     set_trigger = BaseBracket.set_trigger
     __repr__ = BaseBracket.__repr__
 
-    def __init__(self) -> None:
-        pass
+    def __init__(self, mode) -> None:
+        self.mode = mode
 
     def evaluate(self, high: float, low: float) -> bool:
+        if self.mode == 'trail':
+            return self.evaluate_trail(high, low)
+        elif self.mode == 'fixed':
+            return self.evaluate_fixed(high, low)
+        else:
+            raise ValueError("Stop mode must be 'trail' or 'fixed'")
+
+    def evaluate_trail(self, high: float, low: float) -> bool:
         if self.position == -1:
             if self.trigger <= high:
                 return True
@@ -222,18 +232,7 @@ class TrailStop():
                 self.trigger = max(self.trigger, high - self.distance)
                 return False
 
-
-@jitclass(bracket_spec)
-class FixedStop():
-    open = BaseBracket.open
-    set_entry = BaseBracket.set_entry
-    set_trigger = BaseBracket.set_trigger
-    __repr__ = BaseBracket.__repr__
-
-    def __init__(self) -> None:
-        pass
-
-    def evaluate(self, high: float, low: float) -> bool:
+    def evaluate_fixed(self, high: float, low: float) -> bool:
         if self.position == 1 and self.trigger >= low:
             return True
         elif self.position == -1 and self.trigger <= high:
@@ -248,13 +247,17 @@ class TakeProfit():
 
     open = BaseBracket.open
     set_entry = BaseBracket.set_entry
-    set_trigger = BaseBracket.set_trigger
     __repr__ = BaseBracket.__repr__
 
     def __init__(self, multiple: float) -> None:
         self.multiple = multiple
 
     def evaluate(self, high: float, low: float) -> bool:
+        if self.multiple:
+            return self._evaluate(high, low)
+        return False
+
+    def _evaluate(self, high: float, low: float) -> bool:
         if self.position == -1 and self.trigger >= low:
             return True
         elif self.position == 1 and self.trigger <= high:
@@ -268,39 +271,18 @@ class TakeProfit():
 
 
 @jitclass
-class NoTakeProfit:
-    __repr__ = BaseBracket.__repr__
-
-    def __init__(self) -> None:
-        pass
-
-    def open(self, distance, signal, high, low):
-        pass
-
-    def evaluate(self, high: float, low: float) -> bool:
-        return False
-
-
-stop_dict = {'fixed': FixedStop, 'trail': TrailStop}
-
-A = TypeVar('A', bound='Adjust')
-
-adjusted_stop_type = deferred_type()
-
-
-@jitclass([('adjusted_stop', adjusted_stop_type)])
 class Adjust:
 
     adjusted_stop_distance: float
+    adjusted_stop: Stop
     position: int
     done: bool
     trigger_multiple: float
     stop_multiple: float
     trigger: float
 
-    def __init__(self, adjusted_stop: BaseBracket,
-                 trigger_multiple: float, stop_multiple: float
-                 ) -> None:
+    def __init__(self, adjusted_stop: Stop, trigger_multiple: float,
+                 stop_multiple: float) -> None:
         self.adjusted_stop = adjusted_stop
         self.trigger_multiple = trigger_multiple
         self.stop_multiple = stop_multiple
@@ -314,8 +296,13 @@ class Adjust:
         self.done = False
         # print(f'Adjust init: {self}')
 
-    def evaluate(self, order: BaseBracket, high: float, low: float
-                 ) -> BaseBracket:
+    def evaluate(self, order: Stop, high: float, low: float) -> Stop:
+        if self.trigger_multiple:
+            return self._evaluate(order, high, low)
+        return order
+
+    def _evaluate(self, order: Stop, high: float, low: float
+                  ) -> Stop:
         """
         Verify whether stop should be adjusted, return correct stop
         (adjusted or not).
@@ -345,41 +332,26 @@ class Adjust:
             [f'{k}={v}' for k, v in self.__dict__.items()]) + ')')
 
 
-@jitclass
-class NoAdjust:
-    def __init__(self) -> None:
-        pass
-
-    def open(self, stop_distance: float,  signal: int, high: float = 0,
-             low: float = 0, entry: float = 0) -> None:
-        pass
-
-    def evaluate(self, order: BaseBracket, *args) -> BaseBracket:
-        return order
-
-
-stop_type = deferred_type()
-tp_type = deferred_type()
-adjust_type = deferred_type()
-
-context_spec = [('stop', stop_type),
-                ('tp', tp_type),
-                ('adjust', adjust_type),
-                ('signal', int32),
-                ('high', float32),
-                ('low', float32),
-                ('distance', float32),
-                ]
+context_spec = [
+    ('signal', int32),
+    ('high', float32),
+    ('low', float32),
+    ('distance', float32),
+]
 
 
 @jitclass(context_spec)
 class Context:
+    stop: Stop
+    unadjusted_stop: Stop
+    tp: TakeProfit
+    adjust: Adjust
     always_on: bool
     position: int
 
-    def __init__(self, stop: BaseBracket, tp: Union[TakeProfit, NoTakeProfit],
-                 adjust: Union[Adjust, NoAdjust], always_on: bool = True
-                 ) -> None:
+    def __init__(self, stop: Stop, tp: TakeProfit, adjust: Adjust,
+                 always_on: bool = True) -> None:
+        self.unadjusted_stop = stop
         self.stop = stop
         self.tp = tp
         self.adjust = adjust
@@ -425,6 +397,7 @@ class Context:
 
     def close_position(self) -> None:
         self.position = 0
+        self.stop = self.unadjusted_stop
         # print('---------------------')
 
     def eval_brackets(self) -> None:
@@ -468,10 +441,9 @@ def _stop_loss(data: np.array, stop: Context) -> np.array:
     return out
 
 
-def param_factory(mode: StopMode, tp_multiple: Optional[float] = None,
+def param_factory(mode: StopMode, tp_multiple: Optional[float] = 0,
                   adjust_tuple: Optional[Tuple[StopMode, float, float]] = None
-                  ) -> Tuple[BaseBracket, Union[TakeProfit, NoTakeProfit],
-                             Union[Adjust, NoAdjust]]:
+                  ) -> Tuple[Stop, TakeProfit, Adjust]:
     """
     Verify validity of parameters and based on them return appropriate
     objects for Context.
@@ -483,44 +455,22 @@ def param_factory(mode: StopMode, tp_multiple: Optional[float] = None,
         assert adjust_tuple[1] < tp_multiple, (
             'Take profit multiple must be > adjust trigger multiple. Otherwise'
             ' position would be closed before stop loss can be adjusted.')
-    assert stop_dict.get(mode), (f"Invalid stop loss type: {mode}. "
-                                 f"Must be 'fixed' or 'trail'")
-    stop = stop_dict.get(mode)()
-    if tp_multiple:
-        tp = TakeProfit(tp_multiple)
-    else:
-        tp = NoTakeProfit()
+    assert mode in ['fixed', 'trail'], (f"Invalid stop loss type: {mode}. "
+                                        f"Must be 'fixed' or 'trail'")
+    stop = Stop(mode)
+    tp = TakeProfit(tp_multiple)
 
     if adjust_tuple:
-        assert stop_dict.get(adjust_tuple[0]), (
+        assert (adjust_tuple[0] in ['fixed', 'trail']), (
             f"Invalid adjusted stop loss type: "
             f"{adjust_tuple[0]}. "
             f"Must be 'fixed' or 'trail'")
-        adjusted_stop = stop_dict.get(adjust_tuple[0])()
-
-        try:
-            adjusted_stop_type.define(typeof(adjusted_stop))
-        except TypeError:
-            pass
-
-        adjust = Adjust(adjusted_stop, adjust_tuple[1],
-                        adjust_tuple[2])
+        adjusted_stop = Stop(adjust_tuple[0])
+        # print(f'adjusted stop: {adjusted_stop}')
+        adjust = Adjust(adjusted_stop, adjust_tuple[1], adjust_tuple[2])
     else:
-        adjust = NoAdjust()
-
-    try:
-        stop_type.define(typeof(stop))
-    except TypeError:
-        pass
-    try:
-        tp_type.define(typeof(tp))
-    except TypeError:
-        pass
-    try:
-        adjust_type.define(typeof(adjust))
-    except TypeError:
-        pass
-
+        adjust = Adjust(Stop('fixed'), 0, 0)
+    # print(f'stop: {stop}, tp: {tp}, adjust: {adjust}')
     return (stop, tp, adjust)
 
 
